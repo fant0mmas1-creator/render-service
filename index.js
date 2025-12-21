@@ -8,24 +8,38 @@ app.use(express.json({ limit: "50mb" }));
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-const JOB_ROOT = "/tmp/jobs";
+/**
+ * ============================
+ * FILESYSTEM JOB STORE (/tmp)
+ * ============================
+ */
+const JOB_DIR = "/tmp/jobs";
 
-function ensureDir(dir) {
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
+function ensureJobDir() {
+  if (!fs.existsSync(JOB_DIR)) {
+    fs.mkdirSync(JOB_DIR, { recursive: true });
   }
 }
 
-function jobDir(job_id) {
-  return path.join(JOB_ROOT, String(job_id));
+function jobFilePath(job_id) {
+  return path.join(JOB_DIR, `${job_id}.json`);
 }
 
-function metaPath(job_id) {
-  return path.join(jobDir(job_id), "meta.json");
+function loadJob(job_id) {
+  const p = jobFilePath(job_id);
+  if (!fs.existsSync(p)) return null;
+  return JSON.parse(fs.readFileSync(p, "utf-8"));
+}
+
+function saveJob(job_id, job) {
+  ensureJobDir();
+  fs.writeFileSync(jobFilePath(job_id), JSON.stringify(job, null, 2));
 }
 
 /**
- * Health
+ * ============================
+ * HEALTH
+ * ============================
  */
 app.get("/", (req, res) => {
   res.send("Render service is running");
@@ -54,26 +68,27 @@ app.post("/collector/audio", upload.any(), async (req, res) => {
       });
     }
 
-    // ✅ ACCEPT FIRST FILE (n8n compatible)
-    const audioFile = req.files[0];
-
-    ensureDir(JOB_ROOT);
-    ensureDir(jobDir(job_id));
-
-    const audioFilePath = path.join(
-      jobDir(job_id),
-      `audio_${index}.mp3`
-    );
-    fs.writeFileSync(audioFilePath, audioFile.buffer);
-
-    if (!fs.existsSync(metaPath(job_id))) {
-      fs.writeFileSync(
-        metaPath(job_id),
-        JSON.stringify({ finalized: false }, null, 2)
-      );
+    const audioFile = req.files.find((f) => f.fieldname === "audio");
+    if (!audioFile) {
+      return res.status(400).json({
+        status: "error",
+        message: "audio field missing",
+      });
     }
 
-    console.log(`A3 file store | job=${job_id} | index=${index}`);
+    let job = loadJob(job_id);
+    if (!job) {
+      job = {
+        job_id,
+        finalized: false,
+        audios: {},
+      };
+    }
+
+    job.audios[String(index)] = audioFile.buffer.toString("base64");
+    saveJob(job_id, job);
+
+    console.log(`A3 store audio | job=${job_id} | index=${index}`);
 
     return res.json({
       status: "ok",
@@ -95,7 +110,6 @@ app.post("/collector/audio", upload.any(), async (req, res) => {
 app.post("/collector/finalize", async (req, res) => {
   try {
     const { job_id } = req.body || {};
-
     if (!job_id) {
       return res.status(400).json({
         status: "error",
@@ -103,17 +117,16 @@ app.post("/collector/finalize", async (req, res) => {
       });
     }
 
-    if (!fs.existsSync(jobDir(job_id))) {
+    const job = loadJob(job_id);
+    if (!job) {
       return res.status(404).json({
         status: "error",
         message: "job not found",
       });
     }
 
-    fs.writeFileSync(
-      metaPath(job_id),
-      JSON.stringify({ finalized: true }, null, 2)
-    );
+    job.finalized = true;
+    saveJob(job_id, job);
 
     console.log(`A4 finalize | job=${job_id}`);
 
@@ -136,7 +149,6 @@ app.post("/collector/finalize", async (req, res) => {
 app.post("/render/prepare", async (req, res) => {
   try {
     const { job_id } = req.body || {};
-
     if (!job_id) {
       return res.status(400).json({
         status: "error",
@@ -144,40 +156,38 @@ app.post("/render/prepare", async (req, res) => {
       });
     }
 
-    if (!fs.existsSync(jobDir(job_id))) {
+    const job = loadJob(job_id);
+    if (!job) {
       return res.status(404).json({
         status: "error",
         message: "job not found",
       });
     }
 
-    const meta = JSON.parse(fs.readFileSync(metaPath(job_id), "utf-8"));
-    if (!meta.finalized) {
+    if (!job.finalized) {
       return res.status(409).json({
         status: "error",
         message: "job not finalized yet",
       });
     }
 
-    const files = fs
-      .readdirSync(jobDir(job_id))
-      .filter((f) => f.startsWith("audio_"))
-      .map((f) => Number(f.replace("audio_", "").replace(".mp3", "")))
+    const indices = Object.keys(job.audios)
+      .map((n) => Number(n))
       .sort((a, b) => a - b);
 
-    const continuous = files.every(
-      (v, i) => i === 0 || v === files[i - 1] + 1
+    const continuous = indices.every(
+      (v, i) => i === 0 || v === indices[i - 1] + 1
     );
 
     console.log(
-      `A5 prepare | job=${job_id} | indices=${files.join(",")} | continuous=${continuous}`
+      `A5 prepare | job=${job_id} | indices=${indices.join(",")} | continuous=${continuous}`
     );
 
     return res.json({
       status: "ok",
       step: "A5",
       job_id,
-      audio_indices: files,
+      audio_indices: indices,
       continuous,
     });
   } catch (err) {
