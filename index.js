@@ -1,16 +1,28 @@
 import express from "express";
 import multer from "multer";
+import fs from "fs";
+import path from "path";
 
 const app = express();
 app.use(express.json({ limit: "50mb" }));
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-/**
- * In-memory job store
- * job_id -> { audios: Map<index, Buffer>, finalized: boolean }
- */
-const JOBS = new Map();
+const JOB_ROOT = "/tmp/jobs";
+
+function ensureDir(dir) {
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+}
+
+function jobDir(job_id) {
+  return path.join(JOB_ROOT, String(job_id));
+}
+
+function metaPath(job_id) {
+  return path.join(jobDir(job_id), "meta.json");
+}
 
 /**
  * Health
@@ -21,7 +33,7 @@ app.get("/", (req, res) => {
 
 /**
  * ============================
- * COLLECTOR AUDIO
+ * COLLECTOR AUDIO (A3)
  * ============================
  */
 app.post("/collector/audio", upload.any(), async (req, res) => {
@@ -50,14 +62,25 @@ app.post("/collector/audio", upload.any(), async (req, res) => {
       });
     }
 
-    if (!JOBS.has(job_id)) {
-      JOBS.set(job_id, { audios: new Map(), finalized: false });
+    ensureDir(JOB_ROOT);
+    ensureDir(jobDir(job_id));
+
+    // save audio
+    const audioFilePath = path.join(
+      jobDir(job_id),
+      `audio_${index}.mp3`
+    );
+    fs.writeFileSync(audioFilePath, audioFile.buffer);
+
+    // init meta if not exists
+    if (!fs.existsSync(metaPath(job_id))) {
+      fs.writeFileSync(
+        metaPath(job_id),
+        JSON.stringify({ finalized: false }, null, 2)
+      );
     }
 
-    const job = JOBS.get(job_id);
-    job.audios.set(Number(index), audioFile.buffer);
-
-    console.log(`A3 store audio | job=${job_id} | index=${index}`);
+    console.log(`A3 file store | job=${job_id} | index=${index}`);
 
     return res.json({
       status: "ok",
@@ -73,12 +96,13 @@ app.post("/collector/audio", upload.any(), async (req, res) => {
 
 /**
  * ============================
- * COLLECTOR FINALIZE
+ * COLLECTOR FINALIZE (A4)
  * ============================
  */
 app.post("/collector/finalize", async (req, res) => {
   try {
     const { job_id } = req.body || {};
+
     if (!job_id) {
       return res.status(400).json({
         status: "error",
@@ -86,14 +110,17 @@ app.post("/collector/finalize", async (req, res) => {
       });
     }
 
-    if (!JOBS.has(job_id)) {
+    if (!fs.existsSync(jobDir(job_id))) {
       return res.status(404).json({
         status: "error",
         message: "job not found",
       });
     }
 
-    JOBS.get(job_id).finalized = true;
+    fs.writeFileSync(
+      metaPath(job_id),
+      JSON.stringify({ finalized: true }, null, 2)
+    );
 
     console.log(`A4 finalize | job=${job_id}`);
 
@@ -124,36 +151,40 @@ app.post("/render/prepare", async (req, res) => {
       });
     }
 
-    if (!JOBS.has(job_id)) {
+    if (!fs.existsSync(jobDir(job_id))) {
       return res.status(404).json({
         status: "error",
         message: "job not found",
       });
     }
 
-    const job = JOBS.get(job_id);
-
-    if (!job.finalized) {
+    const meta = JSON.parse(fs.readFileSync(metaPath(job_id), "utf-8"));
+    if (!meta.finalized) {
       return res.status(409).json({
         status: "error",
         message: "job not finalized yet",
       });
     }
 
-    const indices = Array.from(job.audios.keys()).sort((a, b) => a - b);
-    const continuous = indices.every(
-      (v, i) => i === 0 || v === indices[i - 1] + 1
+    const files = fs
+      .readdirSync(jobDir(job_id))
+      .filter((f) => f.startsWith("audio_"))
+      .map((f) => Number(f.replace("audio_", "").replace(".mp3", "")))
+      .sort((a, b) => a - b);
+
+    const continuous = files.every(
+      (v, i) => i === 0 || v === files[i - 1] + 1
     );
 
     console.log(
-      `A5 prepare | job=${job_id} | indices=${indices.join(",")} | continuous=${continuous}`
+      `A5 prepare | job=${job_id} | indices=${files.join(",")} | continuous=${continuous}`
     );
 
     return res.json({
       status: "ok",
       step: "A5",
       job_id,
-      audio_indices: indices,
+      audio_indices: files,
       continuous,
     });
   } catch (err) {
