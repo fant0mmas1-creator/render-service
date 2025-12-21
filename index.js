@@ -54,25 +54,18 @@ app.post("/collector/audio", upload.any(), async (req, res) => {
       });
     }
 
-    const audioFile = req.files.find((f) => f.fieldname === "audio");
-    if (!audioFile) {
-      return res.status(400).json({
-        status: "error",
-        message: "audio field missing",
-      });
-    }
+    // ✅ ACCEPT FIRST FILE (n8n compatible)
+    const audioFile = req.files[0];
 
     ensureDir(JOB_ROOT);
     ensureDir(jobDir(job_id));
 
-    // save audio
     const audioFilePath = path.join(
       jobDir(job_id),
       `audio_${index}.mp3`
     );
     fs.writeFileSync(audioFilePath, audioFile.buffer);
 
-    // init meta if not exists
     if (!fs.existsSync(metaPath(job_id))) {
       fs.writeFileSync(
         metaPath(job_id),
