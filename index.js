@@ -82,10 +82,20 @@ app.get("/", (req, res) => {
 app.post("/collector/audio", upload.single("audio"), async (req, res) => {
   try {
     const { job_id, index } = req.body;
-    if (!job_id || index === undefined)
-      return res.status(400).json({ status: "error", message: "missing job_id or index" });
-    if (!req.file)
-      return res.status(400).json({ status: "error", message: "audio file missing" });
+
+    if (!job_id || index === undefined) {
+      return res.status(400).json({
+        status: "error",
+        message: "missing job_id or index",
+      });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({
+        status: "error",
+        message: "audio file missing",
+      });
+    }
 
     await r2.send(
       new PutObjectCommand({
@@ -96,26 +106,47 @@ app.post("/collector/audio", upload.single("audio"), async (req, res) => {
       })
     );
 
-    res.json({ status: "ok", job_id, index });
+    res.json({
+      status: "ok",
+      job_id,
+      index,
+    });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ status: "error", message: "internal error" });
+    console.error("UPLOAD ERROR:", err);
+    res.status(500).json({
+      status: "error",
+      message: "internal error",
+    });
   }
 });
 
 /* =========================
-   Finalize
+   Finalize audio
 ========================= */
 app.post("/collector/finalize", async (req, res) => {
   const { job_id } = req.body;
-  if (!job_id)
-    return res.status(400).json({ status: "error", message: "missing job_id" });
+
+  if (!job_id) {
+    return res.status(400).json({
+      status: "error",
+      message: "missing job_id",
+    });
+  }
 
   const indexes = await listAudioIndexes(job_id);
-  if (indexes.length === 0)
-    return res.status(404).json({ status: "error", message: "job not found" });
 
-  res.json({ status: "ok", job_id, chunks: indexes.length });
+  if (indexes.length === 0) {
+    return res.status(404).json({
+      status: "error",
+      message: "job not found",
+    });
+  }
+
+  res.json({
+    status: "ok",
+    job_id,
+    chunks: indexes.length,
+  });
 });
 
 /* =========================
@@ -123,12 +154,22 @@ app.post("/collector/finalize", async (req, res) => {
 ========================= */
 app.post("/render/prepare", async (req, res) => {
   const { job_id } = req.body;
-  if (!job_id)
-    return res.status(400).json({ status: "error", message: "missing job_id" });
+
+  if (!job_id) {
+    return res.status(400).json({
+      status: "error",
+      message: "missing job_id",
+    });
+  }
 
   const indexes = await listAudioIndexes(job_id);
-  if (indexes.length === 0)
-    return res.status(404).json({ status: "error", message: "job not found" });
+
+  if (indexes.length === 0) {
+    return res.status(404).json({
+      status: "error",
+      message: "job not found",
+    });
+  }
 
   res.json({
     status: "ok",
@@ -139,7 +180,38 @@ app.post("/render/prepare", async (req, res) => {
 });
 
 /* =========================
-   Start
+   Render video (SKELETON)
+========================= */
+app.post("/render/video", async (req, res) => {
+  const { job_id, audio_keys, audio_indexes, preset } = req.body;
+
+  if (!job_id || !Array.isArray(audio_keys) || audio_keys.length === 0) {
+    return res.status(400).json({
+      status: "error",
+      job_id,
+      message: "invalid_input",
+    });
+  }
+
+  if (preset !== "static-image") {
+    return res.status(400).json({
+      status: "error",
+      job_id,
+      message: "unsupported_preset",
+    });
+  }
+
+  // 🚧 Skeleton: chưa render thật (B2.2 sẽ xử lý)
+  return res.json({
+    status: "ok",
+    job_id,
+    video_key: `video/${job_id}/final.mp4`,
+    duration_sec: 0,
+  });
+});
+
+/* =========================
+   Start server
 ========================= */
 app.listen(PORT, () => {
   console.log(`Backend running on port ${PORT}`);
