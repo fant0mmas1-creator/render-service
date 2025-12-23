@@ -14,15 +14,26 @@ const PORT = process.env.PORT || 3000;
 ========================= */
 app.use(express.json());
 
+// 🔥 CORS — BẮT BUỘC
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 20 * 1024 * 1024, // 20MB / chunk
+    fileSize: 20 * 1024 * 1024,
   },
 });
 
 /* =========================
-   R2 (S3-compatible) Client
+   R2 Client
 ========================= */
 const r2 = new S3Client({
   region: "auto",
@@ -50,13 +61,10 @@ async function listAudioIndexes(jobId) {
     })
   );
 
-  if (!res.Contents || res.Contents.length === 0) return [];
+  if (!res.Contents) return [];
 
   return res.Contents
-    .map((obj) => {
-      const name = obj.Key.split("/").pop();
-      return Number(name.replace(".mp3", ""));
-    })
+    .map((o) => Number(o.Key.split("/").pop().replace(".mp3", "")))
     .filter((n) => !Number.isNaN(n))
     .sort((a, b) => a - b);
 }
@@ -69,26 +77,15 @@ app.get("/", (req, res) => {
 });
 
 /* =========================
-   Upload audio chunk
-   POST /collector/audio
+   Upload audio
 ========================= */
 app.post("/collector/audio", upload.single("audio"), async (req, res) => {
   try {
     const { job_id, index } = req.body;
-
-    if (!job_id || index === undefined) {
-      return res.status(400).json({
-        status: "error",
-        message: "missing job_id or index",
-      });
-    }
-
-    if (!req.file || !req.file.buffer) {
-      return res.status(400).json({
-        status: "error",
-        message: "audio file missing",
-      });
-    }
+    if (!job_id || index === undefined)
+      return res.status(400).json({ status: "error", message: "missing job_id or index" });
+    if (!req.file)
+      return res.status(400).json({ status: "error", message: "audio file missing" });
 
     await r2.send(
       new PutObjectCommand({
@@ -99,103 +96,46 @@ app.post("/collector/audio", upload.single("audio"), async (req, res) => {
       })
     );
 
-    console.log(
-      `AUDIO STORED (R2) | job=${job_id} | index=${index} | size=${req.file.buffer.length}`
-    );
-
-    res.json({
-      status: "ok",
-      job_id,
-      index,
-    });
+    res.json({ status: "ok", job_id, index });
   } catch (err) {
-    console.error("UPLOAD ERROR:", err);
-    res.status(500).json({
-      status: "error",
-      message: "internal error",
-    });
+    console.error(err);
+    res.status(500).json({ status: "error", message: "internal error" });
   }
 });
 
 /* =========================
-   Finalize job
-   POST /collector/finalize
+   Finalize
 ========================= */
 app.post("/collector/finalize", async (req, res) => {
-  try {
-    const { job_id } = req.body;
+  const { job_id } = req.body;
+  if (!job_id)
+    return res.status(400).json({ status: "error", message: "missing job_id" });
 
-    if (!job_id) {
-      return res.status(400).json({
-        status: "error",
-        message: "missing job_id",
-      });
-    }
+  const indexes = await listAudioIndexes(job_id);
+  if (indexes.length === 0)
+    return res.status(404).json({ status: "error", message: "job not found" });
 
-    const indexes = await listAudioIndexes(job_id);
-
-    if (indexes.length === 0) {
-      return res.status(404).json({
-        status: "error",
-        message: "job not found",
-      });
-    }
-
-    console.log(
-      `JOB FINALIZED | job=${job_id} | chunks=${indexes.length}`
-    );
-
-    res.json({
-      status: "ok",
-      job_id,
-      chunks: indexes.length,
-    });
-  } catch (err) {
-    console.error("FINALIZE ERROR:", err);
-    res.status(500).json({
-      status: "error",
-      message: "internal error",
-    });
-  }
+  res.json({ status: "ok", job_id, chunks: indexes.length });
 });
 
 /* =========================
    Render prepare
-   POST /render/prepare
 ========================= */
 app.post("/render/prepare", async (req, res) => {
-  try {
-    const { job_id } = req.body;
+  const { job_id } = req.body;
+  if (!job_id)
+    return res.status(400).json({ status: "error", message: "missing job_id" });
 
-    if (!job_id) {
-      return res.status(400).json({
-        status: "error",
-        message: "missing job_id",
-      });
-    }
+  const indexes = await listAudioIndexes(job_id);
+  if (indexes.length === 0)
+    return res.status(404).json({ status: "error", message: "job not found" });
 
-    const indexes = await listAudioIndexes(job_id);
-
-    if (indexes.length === 0) {
-      return res.status(404).json({
-        status: "error",
-        message: "job not found",
-      });
-    }
-
-    res.json({
-      status: "ok",
-      job_id,
-      audio_indexes: indexes,
-      audio_keys: indexes.map((i) => audioKey(job_id, i)),
-    });
-  } catch (err) {
-    console.error("RENDER PREPARE ERROR:", err);
-    res.status(500).json({
-      status: "error",
-      message: "internal error",
-    });
-  }
+  res.json({
+    status: "ok",
+    job_id,
+    audio_indexes: indexes,
+    audio_keys: indexes.map((i) => audioKey(job_id, i)),
+  });
 });
 
 /* =========================
