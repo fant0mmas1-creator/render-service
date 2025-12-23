@@ -1,15 +1,19 @@
 import express from "express";
 import multer from "multer";
-import fs from "fs";
-import path from "path";
+import {
+  S3Client,
+  PutObjectCommand,
+  ListObjectsV2Command,
+} from "@aws-sdk/client-s3";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ---------- Middleware ----------
+/* =========================
+   Middleware
+========================= */
 app.use(express.json());
 
-// Multer: nhận audio binary từ n8n
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
@@ -17,33 +21,58 @@ const upload = multer({
   },
 });
 
-// ---------- Utils ----------
-function jobDir(jobId) {
-  return path.join("/tmp", jobId);
+/* =========================
+   R2 (S3-compatible) Client
+========================= */
+const r2 = new S3Client({
+  region: "auto",
+  endpoint: process.env.R2_ENDPOINT,
+  credentials: {
+    accessKeyId: process.env.R2_ACCESS_KEY_ID,
+    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
+  },
+});
+
+const BUCKET = process.env.R2_BUCKET;
+
+/* =========================
+   Helpers
+========================= */
+function audioKey(jobId, index) {
+  return `audio/${jobId}/${index}.mp3`;
 }
 
-function ensureDir(dir) {
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
-}
+async function listAudioIndexes(jobId) {
+  const res = await r2.send(
+    new ListObjectsV2Command({
+      Bucket: BUCKET,
+      Prefix: `audio/${jobId}/`,
+    })
+  );
 
-function listAudioIndexes(dir) {
-  if (!fs.existsSync(dir)) return [];
-  return fs
-    .readdirSync(dir)
-    .filter((f) => f.endsWith(".mp3"))
-    .map((f) => Number(f.replace(".mp3", "")))
+  if (!res.Contents || res.Contents.length === 0) return [];
+
+  return res.Contents
+    .map((obj) => {
+      const name = obj.Key.split("/").pop();
+      return Number(name.replace(".mp3", ""));
+    })
+    .filter((n) => !Number.isNaN(n))
     .sort((a, b) => a - b);
 }
 
-// ---------- Health ----------
+/* =========================
+   Health
+========================= */
 app.get("/", (req, res) => {
   res.json({ status: "ok" });
 });
 
-// ---------- Upload audio chunk ----------
-app.post("/collector/audio", upload.single("audio"), (req, res) => {
+/* =========================
+   Upload audio chunk
+   POST /collector/audio
+========================= */
+app.post("/collector/audio", upload.single("audio"), async (req, res) => {
   try {
     const { job_id, index } = req.body;
 
@@ -61,14 +90,17 @@ app.post("/collector/audio", upload.single("audio"), (req, res) => {
       });
     }
 
-    const dir = jobDir(job_id);
-    ensureDir(dir);
-
-    const filePath = path.join(dir, `${index}.mp3`);
-    fs.writeFileSync(filePath, req.file.buffer);
+    await r2.send(
+      new PutObjectCommand({
+        Bucket: BUCKET,
+        Key: audioKey(job_id, index),
+        Body: req.file.buffer,
+        ContentType: "audio/mpeg",
+      })
+    );
 
     console.log(
-      `AUDIO STORED | job=${job_id} | index=${index} | size=${req.file.buffer.length}`
+      `AUDIO STORED (R2) | job=${job_id} | index=${index} | size=${req.file.buffer.length}`
     );
 
     res.json({
@@ -85,8 +117,11 @@ app.post("/collector/audio", upload.single("audio"), (req, res) => {
   }
 });
 
-// ---------- Finalize job ----------
-app.post("/collector/finalize", (req, res) => {
+/* =========================
+   Finalize job
+   POST /collector/finalize
+========================= */
+app.post("/collector/finalize", async (req, res) => {
   try {
     const { job_id } = req.body;
 
@@ -97,19 +132,12 @@ app.post("/collector/finalize", (req, res) => {
       });
     }
 
-    const dir = jobDir(job_id);
-    if (!fs.existsSync(dir)) {
+    const indexes = await listAudioIndexes(job_id);
+
+    if (indexes.length === 0) {
       return res.status(404).json({
         status: "error",
         message: "job not found",
-      });
-    }
-
-    const indexes = listAudioIndexes(dir);
-    if (indexes.length === 0) {
-      return res.status(400).json({
-        status: "error",
-        message: "no audio chunks found",
       });
     }
 
@@ -131,8 +159,11 @@ app.post("/collector/finalize", (req, res) => {
   }
 });
 
-// ---------- Render prepare ----------
-app.post("/render/prepare", (req, res) => {
+/* =========================
+   Render prepare
+   POST /render/prepare
+========================= */
+app.post("/render/prepare", async (req, res) => {
   try {
     const { job_id } = req.body;
 
@@ -143,31 +174,20 @@ app.post("/render/prepare", (req, res) => {
       });
     }
 
-    const dir = jobDir(job_id);
-    if (!fs.existsSync(dir)) {
+    const indexes = await listAudioIndexes(job_id);
+
+    if (indexes.length === 0) {
       return res.status(404).json({
         status: "error",
         message: "job not found",
       });
     }
 
-    const indexes = listAudioIndexes(dir);
-    if (indexes.length === 0) {
-      return res.status(400).json({
-        status: "error",
-        message: "no audio to render",
-      });
-    }
-
-    console.log(
-      `RENDER PREPARE | job=${job_id} | indexes=${indexes.join(",")}`
-    );
-
     res.json({
       status: "ok",
       job_id,
       audio_indexes: indexes,
-      audio_dir: dir,
+      audio_keys: indexes.map((i) => audioKey(job_id, i)),
     });
   } catch (err) {
     console.error("RENDER PREPARE ERROR:", err);
@@ -178,7 +198,9 @@ app.post("/render/prepare", (req, res) => {
   }
 });
 
-// ---------- Start ----------
+/* =========================
+   Start
+========================= */
 app.listen(PORT, () => {
   console.log(`Backend running on port ${PORT}`);
 });
