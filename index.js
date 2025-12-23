@@ -1,14 +1,13 @@
 import express from "express";
 import multer from "multer";
+import { execSync } from "child_process";
+import fs from "fs";
+import path from "path";
 import {
   S3Client,
   PutObjectCommand,
-  ListObjectsV2Command,
   GetObjectCommand,
 } from "@aws-sdk/client-s3";
-import fs from "fs";
-import path from "path";
-import { execSync } from "child_process";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -18,6 +17,7 @@ const PORT = process.env.PORT || 3000;
 ========================= */
 app.use(express.json());
 
+// CORS — BẮT BUỘC cho n8n
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -56,137 +56,94 @@ function videoKey(jobId) {
   return `video/${jobId}/final.mp4`;
 }
 
-async function listAudioIndexes(jobId) {
+async function downloadAudio(jobId, index, targetPath) {
   const res = await r2.send(
-    new ListObjectsV2Command({
+    new GetObjectCommand({
       Bucket: BUCKET,
-      Prefix: `audio/${jobId}/`,
+      Key: audioKey(jobId, index),
     })
   );
 
-  if (!res.Contents) return [];
-
-  return res.Contents
-    .map((o) => Number(o.Key.split("/").pop().replace(".mp3", "")))
-    .filter((n) => !Number.isNaN(n))
-    .sort((a, b) => a - b);
+  const buffer = Buffer.from(await res.Body.transformToByteArray());
+  fs.writeFileSync(targetPath, buffer);
 }
 
 /* =========================
    Health
 ========================= */
-app.get("/", (req, res) => {
+app.get("/", (_, res) => {
   res.json({ status: "ok" });
 });
 
 /* =========================
-   Upload audio
+   Upload audio chunk
 ========================= */
 app.post("/collector/audio", upload.single("audio"), async (req, res) => {
-  const { job_id, index } = req.body;
-  if (!job_id || index === undefined)
-    return res.status(400).json({ status: "error", message: "missing job_id or index" });
-  if (!req.file)
-    return res.status(400).json({ status: "error", message: "audio file missing" });
+  try {
+    const { job_id, index } = req.body;
+    if (!job_id || index === undefined)
+      return res.status(400).json({ status: "error", message: "missing job_id or index" });
+    if (!req.file)
+      return res.status(400).json({ status: "error", message: "audio file missing" });
 
-  await r2.send(
-    new PutObjectCommand({
-      Bucket: BUCKET,
-      Key: audioKey(job_id, index),
-      Body: req.file.buffer,
-      ContentType: "audio/mpeg",
-    })
-  );
+    await r2.send(
+      new PutObjectCommand({
+        Bucket: BUCKET,
+        Key: audioKey(job_id, index),
+        Body: req.file.buffer,
+        ContentType: "audio/mpeg",
+      })
+    );
 
-  res.json({ status: "ok", job_id, index });
+    res.json({ status: "ok", job_id, index });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ status: "error", message: "internal error" });
+  }
 });
 
 /* =========================
-   Finalize
-========================= */
-app.post("/collector/finalize", async (req, res) => {
-  const { job_id } = req.body;
-  if (!job_id)
-    return res.status(400).json({ status: "error", message: "missing job_id" });
-
-  const indexes = await listAudioIndexes(job_id);
-  if (indexes.length === 0)
-    return res.status(404).json({ status: "error", message: "job not found" });
-
-  res.json({ status: "ok", job_id, chunks: indexes.length });
-});
-
-/* =========================
-   Render prepare
-========================= */
-app.post("/render/prepare", async (req, res) => {
-  const { job_id } = req.body;
-  if (!job_id)
-    return res.status(400).json({ status: "error", message: "missing job_id" });
-
-  const indexes = await listAudioIndexes(job_id);
-  if (indexes.length === 0)
-    return res.status(404).json({ status: "error", message: "job not found" });
-
-  res.json({
-    status: "ok",
-    job_id,
-    audio_indexes: indexes,
-    audio_keys: indexes.map((i) => audioKey(job_id, i)),
-  });
-});
-
-/* =========================
-   Render video (STATIC IMAGE = FFmpeg COLOR)
+   Render Video (AUDIO + STATIC IMAGE)
 ========================= */
 app.post("/render/video", async (req, res) => {
-  const { job_id, audio_keys } = req.body;
+  const { job_id, audio_keys, preset } = req.body;
+
   if (!job_id)
     return res.status(400).json({ status: "error", message: "missing job_id" });
+
+  if (!audio_keys || !Array.isArray(audio_keys) || audio_keys.length === 0)
+    return res.status(400).json({ status: "error", message: "missing audio_keys" });
 
   const workDir = `/tmp/${job_id}`;
   fs.mkdirSync(workDir, { recursive: true });
 
-  // Download audio chunks
+  // 1️⃣ Download audio chunks
   for (let i = 0; i < audio_keys.length; i++) {
-    const out = await r2.send(
-      new GetObjectCommand({
-        Bucket: BUCKET,
-        Key: audio_keys[i],
-      })
-    );
-
-    const buf = Buffer.from(await out.Body.transformToByteArray());
-    fs.writeFileSync(path.join(workDir, `${i}.mp3`), buf);
+    await downloadAudio(job_id, i, `${workDir}/${i}.mp3`);
   }
 
-  // Create concat list
-  const listPath = path.join(workDir, "list.txt");
+  // 2️⃣ Create concat list
+  const listFile = `${workDir}/list.txt`;
   fs.writeFileSync(
-    listPath,
-    audio_keys.map((_, i) => `file '${i}.mp3'`).join("\n")
+    listFile,
+    audio_keys.map((_, i) => `file '${workDir}/${i}.mp3'`).join("\n")
   );
 
-  // Concat audio
+  // 3️⃣ Concat audio
   execSync(
-    `ffmpeg -y -f concat -safe 0 -i ${listPath} -c copy ${workDir}/final.mp3`
+    `ffmpeg -y -f concat -safe 0 -i ${listFile} -c copy ${workDir}/final.mp3`
   );
 
-  // Get duration
-  const duration = Number(
-    execSync(
-      `ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 ${workDir}/final.mp3`
-    )
-      .toString()
-      .trim()
-  );
-
-  // 🔥 CREATE VIDEO WITH COLOR FILTER (NO IMAGE FILE)
+  // 4️⃣ Create video using COLOR FILTER (🔥 FIX CHÍNH)
   execSync(
-    `ffmpeg -y -f lavfi -i color=c=black:s=1080x1920:d=${duration} -i ${workDir}/final.mp3 -c:v libx264 -c:a copy -shortest ${workDir}/final.mp4`
+    `ffmpeg -y \
+      -f lavfi -i color=c=black:s=1080x1920:r=30 \
+      -i ${workDir}/final.mp3 \
+      -c:v libx264 -pix_fmt yuv420p \
+      -c:a copy -shortest ${workDir}/final.mp4`
   );
 
-  // Upload video
+  // 5️⃣ Upload video to R2
   const videoBuffer = fs.readFileSync(`${workDir}/final.mp4`);
   await r2.send(
     new PutObjectCommand({
@@ -197,11 +154,18 @@ app.post("/render/video", async (req, res) => {
     })
   );
 
+  // 6️⃣ Get duration
+  const duration = execSync(
+    `ffprobe -i ${workDir}/final.mp4 -show_entries format=duration -v quiet -of csv="p=0"`
+  )
+    .toString()
+    .trim();
+
   res.json({
     status: "ok",
     job_id,
     video_key: videoKey(job_id),
-    duration_sec: duration,
+    duration_sec: Number(duration),
   });
 });
 
