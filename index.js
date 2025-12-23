@@ -1,14 +1,14 @@
 import express from "express";
 import multer from "multer";
+import fs from "fs";
+import path from "path";
+import { execSync } from "child_process";
 import {
   S3Client,
   PutObjectCommand,
   ListObjectsV2Command,
   GetObjectCommand,
 } from "@aws-sdk/client-s3";
-import fs from "fs";
-import path from "path";
-import { spawn } from "child_process";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -43,6 +43,7 @@ const r2 = new S3Client({
     secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
   },
 });
+
 const BUCKET = process.env.R2_BUCKET;
 
 /* =========================
@@ -50,6 +51,10 @@ const BUCKET = process.env.R2_BUCKET;
 ========================= */
 function audioKey(jobId, index) {
   return `audio/${jobId}/${index}.mp3`;
+}
+
+function videoKey(jobId) {
+  return `video/${jobId}/final.mp4`;
 }
 
 async function listAudioIndexes(jobId) {
@@ -66,44 +71,16 @@ async function listAudioIndexes(jobId) {
     .sort((a, b) => a - b);
 }
 
-function streamToFile(readable, filePath) {
-  return new Promise((resolve, reject) => {
-    const ws = fs.createWriteStream(filePath);
-    readable.pipe(ws);
-    ws.on("finish", resolve);
-    ws.on("error", reject);
-  });
-}
-
-function run(cmd, args) {
-  return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args);
-    let stderr = "";
-    p.stderr.on("data", (d) => (stderr += d.toString()));
-    p.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(stderr));
-    });
-  });
-}
-
-async function probeDuration(filePath) {
-  return new Promise((resolve, reject) => {
-    const p = spawn("ffprobe", [
-      "-v",
-      "error",
-      "-show_entries",
-      "format=duration",
-      "-of",
-      "default=noprint_wrappers=1:nokey=1",
-      filePath,
-    ]);
-    let out = "";
-    p.stdout.on("data", (d) => (out += d.toString()));
-    p.on("close", (code) => {
-      if (code === 0) resolve(Number(out.trim()));
-      else reject(new Error("ffprobe failed"));
-    });
+async function downloadObject(key, outPath) {
+  const res = await r2.send(
+    new GetObjectCommand({ Bucket: BUCKET, Key: key })
+  );
+  const stream = res.Body;
+  await new Promise((resolve, reject) => {
+    const w = fs.createWriteStream(outPath);
+    stream.pipe(w);
+    w.on("finish", resolve);
+    w.on("error", reject);
   });
 }
 
@@ -142,9 +119,9 @@ app.post("/collector/audio", upload.single("audio"), async (req, res) => {
 });
 
 /* =========================
-   Finalize audio
+   Render video (AUDIO-ONLY)
 ========================= */
-app.post("/collector/finalize", async (req, res) => {
+app.post("/render/video", async (req, res) => {
   const { job_id } = req.body;
   if (!job_id)
     return res.status(400).json({ status: "error", message: "missing job_id" });
@@ -153,105 +130,57 @@ app.post("/collector/finalize", async (req, res) => {
   if (indexes.length === 0)
     return res.status(404).json({ status: "error", message: "job not found" });
 
-  res.json({ status: "ok", job_id, chunks: indexes.length });
-});
+  const workDir = `/tmp/${job_id}`;
+  fs.mkdirSync(workDir, { recursive: true });
 
-/* =========================
-   Render prepare
-========================= */
-app.post("/render/prepare", async (req, res) => {
-  const { job_id } = req.body;
-  if (!job_id)
-    return res.status(400).json({ status: "error", message: "missing job_id" });
+  // download audio
+  for (const i of indexes) {
+    await downloadObject(audioKey(job_id, i), `${workDir}/${i}.mp3`);
+  }
 
-  const indexes = await listAudioIndexes(job_id);
-  if (indexes.length === 0)
-    return res.status(404).json({ status: "error", message: "job not found" });
+  // concat audio
+  const listFile = `${workDir}/list.txt`;
+  fs.writeFileSync(
+    listFile,
+    indexes.map((i) => `file '${i}.mp3'`).join("\n")
+  );
+
+  const audioOut = `${workDir}/final.mp3`;
+  execSync(`ffmpeg -y -f concat -safe 0 -i ${listFile} -c copy ${audioOut}`);
+
+  // create static video
+  const videoOut = `${workDir}/final.mp4`;
+  execSync(
+    `ffmpeg -y -loop 1 -i /usr/share/ffmpeg/black.png -i ${audioOut} -c:v libx264 -c:a copy -shortest ${videoOut}`
+  );
+
+  // duration
+  const duration = Number(
+    execSync(
+      `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 ${videoOut}`
+    ).toString()
+  );
+
+  // 🔥 UPLOAD VIDEO
+  await r2.send(
+    new PutObjectCommand({
+      Bucket: BUCKET,
+      Key: videoKey(job_id),
+      Body: fs.readFileSync(videoOut),
+      ContentType: "video/mp4",
+    })
+  );
 
   res.json({
     status: "ok",
     job_id,
-    audio_indexes: indexes,
-    audio_keys: indexes.map((i) => audioKey(job_id, i)),
+    video_key: videoKey(job_id),
+    duration_sec: Number(duration.toFixed(2)),
   });
 });
 
 /* =========================
-   Render video (AUDIO CONCAT ONLY)
-========================= */
-app.post("/render/video", async (req, res) => {
-  const { job_id, audio_keys, preset } = req.body;
-
-  if (!job_id || !Array.isArray(audio_keys) || audio_keys.length === 0) {
-    return res.status(400).json({ status: "error", job_id, message: "invalid_input" });
-  }
-  if (preset !== "static-image") {
-    return res.status(400).json({ status: "error", job_id, message: "unsupported_preset" });
-  }
-
-  const workDir = path.join("/tmp", `render-${job_id}`);
-  fs.mkdirSync(workDir, { recursive: true });
-
-  try {
-    // 1) Fetch audio chunks
-    const localFiles = [];
-    for (let i = 0; i < audio_keys.length; i++) {
-      const key = audio_keys[i];
-      const local = path.join(workDir, `${i}.mp3`);
-      const obj = await r2.send(
-        new GetObjectCommand({ Bucket: BUCKET, Key: key })
-      );
-      await streamToFile(obj.Body, local);
-      localFiles.push(local);
-    }
-
-    // 2) Create concat list
-    const listFile = path.join(workDir, "list.txt");
-    fs.writeFileSync(
-      listFile,
-      localFiles.map((f) => `file '${f}'`).join("\n")
-    );
-
-    // 3) Concat audio
-    const finalAudio = path.join(workDir, "final_audio.mp3");
-    await run("ffmpeg", [
-      "-y",
-      "-f",
-      "concat",
-      "-safe",
-      "0",
-      "-i",
-      listFile,
-      "-c",
-      "copy",
-      finalAudio,
-    ]);
-
-    // 4) Probe duration
-    const duration = await probeDuration(finalAudio);
-
-    // 5) Return (video chưa render)
-    return res.json({
-      status: "ok",
-      job_id,
-      video_key: `video/${job_id}/final.mp4`,
-      duration_sec: Number(duration.toFixed(2)),
-    });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({
-      status: "error",
-      job_id,
-      message: "audio_concat_failed",
-    });
-  } finally {
-    // cleanup
-    fs.rmSync(workDir, { recursive: true, force: true });
-  }
-});
-
-/* =========================
-   Start server
+   Start
 ========================= */
 app.listen(PORT, () => {
   console.log(`Backend running on port ${PORT}`);
