@@ -2,23 +2,16 @@ import express from "express";
 import multer from "multer";
 import fs from "fs";
 import path from "path";
-import { execSync } from "child_process";
+import { exec } from "child_process";
 import {
   S3Client,
   PutObjectCommand,
   GetObjectCommand,
   ListObjectsV2Command,
 } from "@aws-sdk/client-s3";
-import { fileURLToPath } from "url";
 
-/* =========================
-   Init
-========================= */
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 /* =========================
    Middleware
@@ -66,15 +59,19 @@ app.get("/", (_, res) => {
 });
 
 /* =========================
-   Upload Audio Chunk
+   Upload audio chunk
 ========================= */
 app.post("/collector/audio", upload.single("audio"), async (req, res) => {
   try {
     const { job_id, index } = req.body;
     if (!job_id || index === undefined)
-      return res.status(400).json({ status: "error", message: "missing job_id or index" });
+      return res
+        .status(400)
+        .json({ status: "error", message: "missing job_id or index" });
     if (!req.file)
-      return res.status(400).json({ status: "error", message: "audio file missing" });
+      return res
+        .status(400)
+        .json({ status: "error", message: "audio file missing" });
 
     await r2.send(
       new PutObjectCommand({
@@ -93,99 +90,123 @@ app.post("/collector/audio", upload.single("audio"), async (req, res) => {
 });
 
 /* =========================
-   Render Video (STABLE)
+   Render Video (ASYNC – 502 SAFE)
 ========================= */
 app.post("/render/video", async (req, res) => {
-  try {
-    const { job_id } = req.body;
-    if (!job_id)
-      return res.status(400).json({ status: "error", message: "missing job_id" });
+  const { job_id } = req.body;
+  if (!job_id)
+    return res
+      .status(400)
+      .json({ status: "error", message: "missing job_id" });
 
+  /* 🔹 TRẢ RESPONSE NGAY */
+  res.json({
+    status: "accepted",
+    job_id,
+    message: "render started in background",
+  });
+
+  /* 🔹 RENDER NGẦM */
+  setImmediate(async () => {
     const workDir = `/tmp/${job_id}`;
-    fs.mkdirSync(workDir, { recursive: true });
+    try {
+      fs.mkdirSync(workDir, { recursive: true });
 
-    /* 1️⃣ LIST AUDIO */
-    const list = await r2.send(
-      new ListObjectsV2Command({
-        Bucket: BUCKET,
-        Prefix: audioPrefix(job_id),
-      })
-    );
-
-    if (!list.Contents || list.Contents.length === 0)
-      return res.status(404).json({ status: "error", message: "no audio found" });
-
-    const audioKeys = list.Contents
-      .map((o) => o.Key)
-      .filter((k) => k.endsWith(".mp3"))
-      .sort((a, b) => {
-        const ai = Number(a.split("/").pop().replace(".mp3", ""));
-        const bi = Number(b.split("/").pop().replace(".mp3", ""));
-        return ai - bi;
-      });
-
-    /* 2️⃣ DOWNLOAD AUDIO */
-    for (let i = 0; i < audioKeys.length; i++) {
-      const obj = await r2.send(
-        new GetObjectCommand({
+      /* 1️⃣ LIST AUDIO */
+      const list = await r2.send(
+        new ListObjectsV2Command({
           Bucket: BUCKET,
-          Key: audioKeys[i],
+          Prefix: audioPrefix(job_id),
         })
       );
-      const buffer = Buffer.from(await obj.Body.transformToByteArray());
-      fs.writeFileSync(path.join(workDir, `${i}.mp3`), buffer);
+
+      if (!list.Contents || list.Contents.length === 0) {
+        console.error("NO AUDIO FOUND:", job_id);
+        return;
+      }
+
+      const audioKeys = list.Contents
+        .map((o) => o.Key)
+        .filter((k) => k.endsWith(".mp3"))
+        .sort((a, b) => {
+          const ai = Number(a.split("/").pop().replace(".mp3", ""));
+          const bi = Number(b.split("/").pop().replace(".mp3", ""));
+          return ai - bi;
+        });
+
+      /* 2️⃣ DOWNLOAD AUDIO */
+      for (let i = 0; i < audioKeys.length; i++) {
+        const obj = await r2.send(
+          new GetObjectCommand({
+            Bucket: BUCKET,
+            Key: audioKeys[i],
+          })
+        );
+        const buffer = Buffer.from(
+          await obj.Body.transformToByteArray()
+        );
+        fs.writeFileSync(path.join(workDir, `${i}.mp3`), buffer);
+      }
+
+      /* 3️⃣ CONCAT AUDIO */
+      const listFile = path.join(workDir, "list.txt");
+      fs.writeFileSync(
+        listFile,
+        audioKeys.map((_, i) => `file '${i}.mp3'`).join("\n")
+      );
+
+      await execPromise(
+        `ffmpeg -y -f concat -safe 0 -i ${listFile} -c copy ${workDir}/final.mp3`
+      );
+
+      /* 4️⃣ GET DURATION */
+      const duration = Number(
+        (
+          await execPromise(
+            `ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 ${workDir}/final.mp3`
+          )
+        ).trim()
+      );
+
+      /* 5️⃣ RENDER VIDEO (STATIC BG) */
+      await execPromise(
+        `ffmpeg -y -f lavfi -i color=c=black:s=1080x1920:r=30:d=${duration} \
+         -i ${workDir}/final.mp3 \
+         -c:v libx264 -pix_fmt yuv420p \
+         -c:a copy -shortest ${workDir}/final.mp4`
+      );
+
+      /* 6️⃣ UPLOAD VIDEO */
+      const videoBuffer = fs.readFileSync(
+        path.join(workDir, "final.mp4")
+      );
+      await r2.send(
+        new PutObjectCommand({
+          Bucket: BUCKET,
+          Key: videoKey(job_id),
+          Body: videoBuffer,
+          ContentType: "video/mp4",
+        })
+      );
+
+      console.log("RENDER DONE:", job_id);
+    } catch (err) {
+      console.error("RENDER ASYNC ERROR:", err);
     }
-
-    /* 3️⃣ CONCAT AUDIO */
-    const listFile = path.join(workDir, "list.txt");
-    fs.writeFileSync(
-      listFile,
-      audioKeys.map((_, i) => `file '${i}.mp3'`).join("\n")
-    );
-
-    execSync(
-      `ffmpeg -y -f concat -safe 0 -i ${listFile} -c copy ${workDir}/final.mp3`
-    );
-
-    /* 4️⃣ GET DURATION */
-    const duration = Number(
-      execSync(
-        `ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 ${workDir}/final.mp3`
-      )
-        .toString()
-        .trim()
-    );
-
-    /* 5️⃣ RENDER VIDEO WITH BG IMAGE ✅ */
-    const bgImage = path.join(__dirname, "assets", "bg.png");
-
-    execSync(
-      `ffmpeg -y -loop 1 -i ${bgImage} -i ${workDir}/final.mp3 \
-       -c:v libx264 -pix_fmt yuv420p -shortest ${workDir}/final.mp4`
-    );
-
-    /* 6️⃣ UPLOAD VIDEO */
-    const videoBuffer = fs.readFileSync(path.join(workDir, "final.mp4"));
-    await r2.send(
-      new PutObjectCommand({
-        Bucket: BUCKET,
-        Key: videoKey(job_id),
-        Body: videoBuffer,
-        ContentType: "video/mp4",
-      })
-    );
-
-    res.json({
-      status: "ok",
-      job_id,
-      video_key: videoKey(job_id),
-      duration_sec: duration,
-    });
-  } catch (err) {
-    console.error("RENDER VIDEO ERROR:", err);
-    res.status(500).json({ status: "error", message: "render failed" });
-  }
+  });
 });
+
+/* =========================
+   Utils
+========================= */
+function execPromise(cmd) {
+  return new Promise((resolve, reject) => {
+    exec(cmd, (err, stdout, stderr) => {
+      if (err) return reject(stderr || err);
+      resolve(stdout);
+    });
+  });
+}
 
 /* =========================
    Start
