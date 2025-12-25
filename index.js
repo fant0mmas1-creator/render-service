@@ -56,6 +56,10 @@ function videoKey(jobId) {
   return `video/${jobId}/final.mp4`;
 }
 
+function parseIndex(key) {
+  return Number(key.split("/").pop().replace(".mp3", ""));
+}
+
 /* =========================
    Health
 ========================= */
@@ -64,15 +68,25 @@ app.get("/", (_, res) => {
 });
 
 /* =========================
-   Upload audio chunk
+   Upload Audio Chunk
 ========================= */
 app.post("/collector/audio", upload.single("audio"), async (req, res) => {
   try {
     const { job_id, index } = req.body;
-    if (!job_id || index === undefined)
-      return res.status(400).json({ status: "error", message: "missing job_id or index" });
-    if (!req.file)
-      return res.status(400).json({ status: "error", message: "audio file missing" });
+
+    if (!job_id || index === undefined) {
+      return res.status(400).json({
+        status: "error",
+        message: "missing job_id or index",
+      });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({
+        status: "error",
+        message: "audio file missing",
+      });
+    }
 
     await r2.send(
       new PutObjectCommand({
@@ -83,26 +97,34 @@ app.post("/collector/audio", upload.single("audio"), async (req, res) => {
       })
     );
 
-    res.json({ status: "ok", job_id, index });
+    res.json({
+      status: "ok",
+      job_id,
+      index,
+    });
   } catch (err) {
     console.error("UPLOAD ERROR:", err);
-    res.status(500).json({ status: "error", message: "internal error" });
+    res.status(500).json({
+      status: "error",
+      message: "upload failed",
+    });
   }
 });
 
 /* =========================
-   Render Video (C1.2 — STABLE)
+   Finalize Audio Job
+   (Checkpoint – NO render)
 ========================= */
-app.post("/render/video", async (req, res) => {
+app.post("/collector/finalize", async (req, res) => {
   try {
     const { job_id } = req.body;
-    if (!job_id)
-      return res.status(400).json({ status: "error", message: "missing job_id" });
+    if (!job_id) {
+      return res.status(400).json({
+        status: "error",
+        message: "missing job_id",
+      });
+    }
 
-    const workDir = `/tmp/${job_id}`;
-    fs.mkdirSync(workDir, { recursive: true });
-
-    /* 1️⃣ LIST AUDIO FROM R2 */
     const list = await r2.send(
       new ListObjectsV2Command({
         Bucket: BUCKET,
@@ -110,42 +132,104 @@ app.post("/render/video", async (req, res) => {
       })
     );
 
-    if (!list.Contents || list.Contents.length === 0)
-      return res.status(404).json({ status: "error", message: "no audio found" });
+    if (!list.Contents || list.Contents.length === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "no audio found",
+      });
+    }
 
-    const audioKeys = list.Contents
+    const audio_keys = list.Contents
       .map((o) => o.Key)
       .filter((k) => k.endsWith(".mp3"))
-      .sort((a, b) => {
-        const ai = Number(a.split("/").pop().replace(".mp3", ""));
-        const bi = Number(b.split("/").pop().replace(".mp3", ""));
-        return ai - bi;
-      });
+      .sort((a, b) => parseIndex(a) - parseIndex(b));
 
-    /* 2️⃣ DOWNLOAD AUDIO */
-    for (let i = 0; i < audioKeys.length; i++) {
+    res.json({
+      status: "ok",
+      job_id,
+      audio_keys,
+      audio_indexes: audio_keys.map(parseIndex),
+      chunks: audio_keys.length,
+    });
+  } catch (err) {
+    console.error("FINALIZE ERROR:", err);
+    res.status(500).json({
+      status: "error",
+      message: "finalize failed",
+    });
+  }
+});
+
+/* =========================
+   Render Prepare
+   (Metadata only – NO render)
+========================= */
+app.post("/render/prepare", async (req, res) => {
+  try {
+    const { job_id, audio_keys } = req.body;
+    if (!job_id || !Array.isArray(audio_keys)) {
+      return res.status(400).json({
+        status: "error",
+        message: "missing job_id or audio_keys",
+      });
+    }
+
+    res.json({
+      status: "ok",
+      job_id,
+      audio_keys,
+      audio_indexes: audio_keys.map(parseIndex),
+    });
+  } catch (err) {
+    console.error("PREPARE ERROR:", err);
+    res.status(500).json({
+      status: "error",
+      message: "prepare failed",
+    });
+  }
+});
+
+/* =========================
+   Render Video
+   (ONLY render happens here)
+========================= */
+app.post("/render/video", async (req, res) => {
+  try {
+    const { job_id, audio_keys, preset = "static-image" } = req.body;
+    if (!job_id || !Array.isArray(audio_keys)) {
+      return res.status(400).json({
+        status: "error",
+        message: "missing job_id or audio_keys",
+      });
+    }
+
+    const workDir = `/tmp/${job_id}`;
+    fs.mkdirSync(workDir, { recursive: true });
+
+    /* 1️⃣ Download audio */
+    for (let i = 0; i < audio_keys.length; i++) {
       const obj = await r2.send(
         new GetObjectCommand({
           Bucket: BUCKET,
-          Key: audioKeys[i],
+          Key: audio_keys[i],
         })
       );
       const buffer = Buffer.from(await obj.Body.transformToByteArray());
       fs.writeFileSync(path.join(workDir, `${i}.mp3`), buffer);
     }
 
-    /* 3️⃣ CONCAT AUDIO */
+    /* 2️⃣ Concat audio */
     const listFile = path.join(workDir, "list.txt");
     fs.writeFileSync(
       listFile,
-      audioKeys.map((_, i) => `file '${i}.mp3'`).join("\n")
+      audio_keys.map((_, i) => `file '${i}.mp3'`).join("\n")
     );
 
     execSync(
       `ffmpeg -y -f concat -safe 0 -i ${listFile} -c copy ${workDir}/final.mp3`
     );
 
-    /* 4️⃣ GET DURATION */
+    /* 3️⃣ Duration */
     const duration = Number(
       execSync(
         `ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 ${workDir}/final.mp3`
@@ -154,7 +238,7 @@ app.post("/render/video", async (req, res) => {
         .trim()
     );
 
-    /* 5️⃣ RENDER VIDEO (COLOR FILTER) */
+    /* 4️⃣ Render static video */
     execSync(
       `ffmpeg -y -f lavfi -i color=c=black:s=1080x1920:r=30:d=${duration} \
        -i ${workDir}/final.mp3 \
@@ -162,7 +246,7 @@ app.post("/render/video", async (req, res) => {
        -c:a copy -shortest ${workDir}/final.mp4`
     );
 
-    /* 6️⃣ UPLOAD VIDEO */
+    /* 5️⃣ Upload video */
     const videoBuffer = fs.readFileSync(path.join(workDir, "final.mp4"));
     await r2.send(
       new PutObjectCommand({
@@ -180,8 +264,11 @@ app.post("/render/video", async (req, res) => {
       duration_sec: duration,
     });
   } catch (err) {
-    console.error("RENDER VIDEO ERROR:", err);
-    res.status(500).json({ status: "error", message: "render failed" });
+    console.error("RENDER ERROR:", err);
+    res.status(500).json({
+      status: "error",
+      message: "render failed",
+    });
   }
 });
 
