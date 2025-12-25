@@ -9,22 +9,22 @@ import {
   GetObjectCommand,
   ListObjectsV2Command,
 } from "@aws-sdk/client-s3";
+import { fileURLToPath } from "url";
 
+/* =========================
+   Init
+========================= */
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 /* =========================
    Middleware
 ========================= */
 app.use(express.json());
 
-// 🔎 IDENTIFY BACKEND VERSION (SAFE)
-app.use((req, res, next) => {
-  res.setHeader("X-Backend-Version", "C1.2-render-video-self-fetch");
-  next();
-});
-
-// CORS
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -55,13 +55,8 @@ const BUCKET = process.env.R2_BUCKET;
 /* =========================
    Helpers
 ========================= */
-function audioPrefix(jobId) {
-  return `audio/${jobId}/`;
-}
-
-function videoKey(jobId) {
-  return `video/${jobId}/final.mp4`;
-}
+const audioPrefix = (jobId) => `audio/${jobId}/`;
+const videoKey = (jobId) => `video/${jobId}/final.mp4`;
 
 /* =========================
    Health
@@ -71,7 +66,7 @@ app.get("/", (_, res) => {
 });
 
 /* =========================
-   Upload audio chunk
+   Upload Audio Chunk
 ========================= */
 app.post("/collector/audio", upload.single("audio"), async (req, res) => {
   try {
@@ -98,7 +93,7 @@ app.post("/collector/audio", upload.single("audio"), async (req, res) => {
 });
 
 /* =========================
-   Render Video (C1.2 — SELF FETCH)
+   Render Video (STABLE)
 ========================= */
 app.post("/render/video", async (req, res) => {
   try {
@@ -161,9 +156,12 @@ app.post("/render/video", async (req, res) => {
         .trim()
     );
 
-    /* 5️⃣ RENDER VIDEO */
+    /* 5️⃣ RENDER VIDEO WITH BG IMAGE ✅ */
+    const bgImage = path.join(__dirname, "assets", "bg.png");
+
     execSync(
-      `ffmpeg -y -f lavfi -i color=c=black:s=1080x1920:r=30:d=${duration} -i ${workDir}/final.mp3 -c:v libx264 -pix_fmt yuv420p -c:a copy -shortest ${workDir}/final.mp4`
+      `ffmpeg -y -loop 1 -i ${bgImage} -i ${workDir}/final.mp3 \
+       -c:v libx264 -pix_fmt yuv420p -shortest ${workDir}/final.mp4`
     );
 
     /* 6️⃣ UPLOAD VIDEO */
